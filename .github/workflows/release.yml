@@ -1,0 +1,309 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: '标记为预发布版本'
+        type: boolean
+        default: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    name: ${{ matrix.arch }} · SDK ${{ matrix.sdk }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - aarch64_cortex-a53
+          - aarch64_cortex-a72
+          - aarch64_generic
+          - arm_cortex-a7_neon-vfpv4
+          - arm_cortex-a9_neon
+          - i386_pentium4
+          - mips_24kc
+          - mipsel_24kc
+          - x86_64
+        sdk:
+          - "24.10"
+          - "25.12"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build packages
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ matrix.arch }}-openwrt-${{ matrix.sdk }}
+          FEEDNAME: luci-app-daed
+          PACKAGES: luci-app-daede
+          NO_REFRESH_CHECK: true
+          INDEX: 1
+          KEY_BUILD: ${{ secrets.OPKG_KEY_BUILD }}
+          PRIVATE_KEY: ${{ secrets.APK_PRIVATE_KEY }}
+
+      - name: Collect packages
+        run: |
+          ARCH="${{ matrix.arch }}"
+          mkdir -p dist/release dist/feed
+          FEED_DIR="bin/packages/${ARCH}/luci-app-daed"
+
+          for f in "$FEED_DIR"/*.ipk; do
+            [ -f "$f" ] || continue
+            case "$(basename "$f")" in Packages*) continue ;; esac
+            base=$(basename "$f" .ipk)
+            safe="${base//\~/.}"
+            cp -v "$f" "dist/release/${safe}.ipk"
+            cp -v "$f" dist/feed/
+          done
+
+          for f in "$FEED_DIR"/*.apk; do
+            [ -f "$f" ] || continue
+            case "$(basename "$f")" in Packages*|APKINDEX*|packages.adb*) continue ;; esac
+            base=$(basename "$f" .apk)
+            safe="${base//\~/.}"
+            # noarch APK 不带架构后缀，补上以区分 SDK/arch
+            if echo "$safe" | grep -q "_${ARCH}\$"; then
+              cp -v "$f" "dist/release/${safe}.apk"
+            else
+              cp -v "$f" "dist/release/${safe}-${ARCH}.apk"
+            fi
+            cp -v "$f" dist/feed/
+          done
+
+          for f in "$FEED_DIR"/Packages* "$FEED_DIR"/APKINDEX* "$FEED_DIR"/packages.adb*; do
+            [ -f "$f" ] || continue
+            cp -v "$f" dist/feed/
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: packages-sdk${{ matrix.sdk }}-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: ignore
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: all-artifacts
+          pattern: packages-*
+
+      - name: Flatten release files
+        run: |
+          mkdir -p dist
+          find all-artifacts -path "*/release/*" -type f -exec cp -v {} dist/ \;
+
+      - name: Determine tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          else
+            echo "tag=v$(date -u +%Y.%m.%d)" >> $GITHUB_OUTPUT
+            echo "prerelease=${{ github.event.inputs.prerelease }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate Release Notes
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+          PREVIOUS_TAG="$(git tag --sort=-creatordate | grep '^v' | grep -v "^${TAG}$" | head -1 || true)"
+
+          if [ -n "$PREVIOUS_TAG" ]; then
+            RANGE="${PREVIOUS_TAG}..HEAD"
+          else
+            RANGE="HEAD"
+          fi
+
+          git log --format='%s%x1f%b%x1e' "$RANGE" > commits.raw
+
+          write_section() {
+            title="$1"
+            pattern="$2"
+            awk -v title="$title" -v pattern="$pattern" '
+              BEGIN { RS = "\036"; FS = "\037"; count = 0 }
+              {
+                subject = $1; body = $2
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", subject)
+                if (subject == "" || subject ~ /^Merge /) next
+                if (subject ~ pattern) {
+                  item = subject
+                  sub(/^[a-z]+([(][^)]+[)])?!?:[[:space:]]*/, "", item)
+                  issue = ""
+                  text = subject "\n" body
+                  if (match(text, /(([Ff]ixes|[Cc]loses|[Rr]esolves|[Rr]efs)[[:space:]]+#[0-9]+)/))
+                    issue = " (" substr(text, RSTART, RLENGTH) ")"
+                  else if (match(text, /#[0-9]+/))
+                    issue = " (" substr(text, RSTART, RLENGTH) ")"
+                  lines[++count] = "- " item issue
+                }
+              }
+              END {
+                if (count > 0) { print "## " title; print ""; for (i = 1; i <= count; i++) print lines[i]; print "" }
+              }
+            ' commits.raw
+          }
+
+          {
+            echo "# luci-app-daede ${TAG}"
+            echo ""
+            if [ -n "$PREVIOUS_TAG" ]; then
+              echo "_Changes since ${PREVIOUS_TAG} / 自 ${PREVIOUS_TAG} 以来的更新。_"
+            else
+              echo "_Initial release notes / 初始发布说明。_"
+            fi
+            echo ""
+            write_section "New Features / 新功能" '^feat([(][^)]+[)])?!?:'
+            write_section "Improvements / 改进" '^(perf|refactor)([(][^)]+[)])?!?:'
+            write_section "Bug Fixes / 问题修复" '^fix([(][^)]+[)])?!?:'
+            write_section "Build & Release / 构建与发布" '^(ci|build)([(][^)]+[)])?!?:'
+            write_section "Documentation / 文档" '^docs([(][^)]+[)])?!?:'
+            write_section "Maintenance / 维护" '^(chore|test)([(][^)]+[)])?!?:'
+
+            echo "## Packages / 安装包"
+            echo ""
+            echo "> **luci-app-daede** 是纯 LuCI 前端包（noarch），各架构通用。"
+            echo "> 后缀含义：\`25.12\` = APK 格式（OpenWrt 主线），\`24.10\` = IPK 格式。"
+            echo ""
+
+            echo "### SDK 25.12 · APK 格式（OpenWrt 主线 / ImmortalWrt 快照）"
+            echo ""
+            for f in dist/*25.12*.apk; do
+              [ -f "$f" ] || continue
+              name=$(basename "$f")
+              # 从文件名提取架构：luci-app-daede-1.1-r1-aarch64_cortex-a53.apk
+              arch=$(echo "$name" | sed 's/.*-\([a-z0-9_]*\)\.apk$/\1/')
+              echo "- \`${arch}\` → [${name}](${BASE}/${name})"
+            done | sort
+
+            echo ""
+            echo "### SDK 24.10 · IPK 格式（OpenWrt 23.05 / ImmortalWrt 稳定版）"
+            echo ""
+            for f in dist/*.ipk; do
+              [ -f "$f" ] || continue
+              name=$(basename "$f")
+              # 文件名形如 luci-app-daede_1.1-r1_all.ipk
+              echo "- [${name}](${BASE}/${name})（all 架构通用）"
+            done | head -1
+          } > release_notes.md
+
+          cat release_notes.md
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Release ${{ steps.meta.outputs.tag }}
+          body_path: release_notes.md
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          files: dist/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prune old releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release list -R "$REPO" --limit 100 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[6:] | .[].tagName' > old_tags.txt
+          if [ ! -s old_tags.txt ]; then
+            echo "Releases <= 6, nothing to prune."
+            exit 0
+          fi
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "Deleting release & tag: $tag"
+            gh release delete "$tag" -R "$REPO" --yes --cleanup-tag
+          done < old_tags.txt
+
+  upload_feed:
+    name: Upload Feed to B2
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() }}
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+          pattern: packages-*
+
+      - name: Organize feed structure
+        run: |
+          mkdir -p feed
+          for dir in artifacts/packages-sdk*; do
+            [ -d "$dir/feed" ] || continue
+            name=$(basename "$dir")
+            sdk=$(echo "$name" | sed 's/packages-sdk\([^-]*\)-.*/\1/')
+            arch=$(echo "$name" | sed 's/packages-sdk[^-]*-//')
+            target="feed/${sdk}/${arch}"
+            mkdir -p "$target"
+            cp -v "$dir/feed/"* "$target/" 2>/dev/null || true
+
+            luci=""
+            i18n=""
+
+            if ls "$target"/luci-app-daede_*.ipk >/dev/null 2>&1; then
+              luci=$(basename "$(ls "$target"/luci-app-daede_*.ipk | sort -V | tail -1)")
+              i18n=$(basename "$(ls "$target"/luci-i18n-daed-zh-cn_*.ipk 2>/dev/null | head -1)")
+            elif ls "$target"/luci-app-daede-*.apk >/dev/null 2>&1; then
+              luci=$(basename "$(ls "$target"/luci-app-daede-*.apk | sort -V | tail -1)")
+              i18n=$(basename "$(ls "$target"/luci-i18n-daed-zh-cn-*.apk 2>/dev/null | head -1)")
+            fi
+
+            if [ -n "$luci" ]; then
+              {
+                echo "luci=$luci"
+                [ -n "$i18n" ] && echo "i18n=$i18n"
+              } > "$target/manifest.txt"
+            fi
+          done
+          find feed -type f | sort
+
+      - name: Upload to Backblaze B2
+        env:
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+        run: |
+          [ -z "$B2_KEY_ID" ] && { echo "No B2 credentials, skipping"; exit 0; }
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [b2]
+          type = b2
+          account = ${B2_KEY_ID}
+          key = ${B2_APPLICATION_KEY}
+          hard_delete = true
+          EOF
+          find feed -type f | grep -q . || { echo "feed empty, skip sync"; exit 0; }
+          rclone sync feed/ "b2:${B2_BUCKET}/openwrt-feed/" \
+            --checksum \
+            --fast-list \
+            --transfers 8 \
+            --checkers 16
