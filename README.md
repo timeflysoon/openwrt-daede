@@ -1,9 +1,9 @@
-# luci-app-daede
+<h1 align="center">luci-app-daede</h1>
 
-OpenWrt LuCI 管理界面，用于 **dae** 和 **daed** 透明代理后端。
+<p align="center">OpenWrt LuCI 管理界面，用于 <b>dae</b> 和 <b>daed</b> 透明代理后端。</p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/daeuniverse/dae/main/logo.png" height="88" alt="dae">
+  <img src="https://raw.githubusercontent.com/kenzok8/kenzok8/main/screenshot/daede/dae-logo.png" height="88" alt="dae">
   &nbsp;&nbsp;&nbsp;
   <img src="https://raw.githubusercontent.com/daeuniverse/daed/main/apps/web/public/logo-rounded.png" height="88" alt="daed">
 </p>
