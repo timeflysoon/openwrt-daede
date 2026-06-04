@@ -8,6 +8,11 @@
   <img src="https://raw.githubusercontent.com/daeuniverse/daed/main/apps/web/public/logo-rounded.png" height="88" alt="daed">
 </p>
 
+## 固件支持
+
+需要用于支持 `dae` / `daed` 的固件，可使用
+[`kenzok8/imagebuilder`](https://github.com/kenzok8/imagebuilder) 构建。
+
 ## 界面预览
 
 <details open>
