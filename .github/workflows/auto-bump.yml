@@ -12,6 +12,7 @@ on:
 permissions:
   contents: write
   actions: write
+  issues: write
 
 env:
   STAGING: auto-bump-staging
@@ -113,3 +114,48 @@ jobs:
           git push origin "origin/$STAGING:main"
           gh workflow run release.yml --ref main -f prerelease=false || \
             gh workflow run release.yml --ref main
+
+  # Independent watchdog: the olicesx perf forks (quic-go/outbound) can go quiet
+  # while official quic-go keeps shipping fixes. Warn (and open a tracking issue)
+  # when our quic-go perf pin is stale, so we can decide whether to backport per
+  # ci/PERF-PATCHES.md. Never blocks the bump.
+  perf-staleness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check perf-fork staleness vs official quic-go
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          . ci/pins.env
+          STALE_DAYS=60
+          q_date=$(gh api repos/kenzok8/quic-go/commits/$QUICGO_COMMIT --jq '.commit.committer.date')
+          o_date=$(gh api repos/kenzok8/outbound/commits/$OUTBOUND_COMMIT --jq '.commit.committer.date')
+          q_age=$(( ( $(date -u +%s) - $(date -u -d "$q_date" +%s) ) / 86400 ))
+          o_age=$(( ( $(date -u +%s) - $(date -u -d "$o_date" +%s) ) / 86400 ))
+          up_tag=$(gh api repos/quic-go/quic-go/releases/latest --jq '.tag_name')
+          up_date=$(gh api repos/quic-go/quic-go/releases/latest --jq '.published_at' | cut -dT -f1)
+          echo "quic-go perf pin age ${q_age}d ($q_date); outbound ${o_age}d ($o_date); official $up_tag ($up_date)"
+          if [ "$q_age" -lt "$STALE_DAYS" ]; then
+            echo "fresh (<${STALE_DAYS}d); no alert."
+            exit 0
+          fi
+          echo "::warning::quic-go perf fork stale ${q_age}d; official quic-go at ${up_tag} (${up_date}). See ci/PERF-PATCHES.md."
+          title="⚠️ Perf fork staleness: quic-go pin ${q_age}d old"
+          body=$(printf '%s\n' \
+            "Automated staleness check (auto-bump.yml)." \
+            "" \
+            "- quic-go perf pin \`${QUICGO_COMMIT}\` last moved **${q_date}** (${q_age}d ago)" \
+            "- outbound perf pin \`${OUTBOUND_COMMIT}\` last moved **${o_date}** (${o_age}d ago)" \
+            "- official quic-go latest release: **${up_tag}** (${up_date})" \
+            "" \
+            "The olicesx perf forks have not moved in a while. Decide whether the newer" \
+            "official quic-go carries a fix worth backporting onto enhanced-with-fixes," \
+            "following ci/PERF-PATCHES.md. Heads-up, not an emergency.")
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "Perf fork staleness in:title" --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
