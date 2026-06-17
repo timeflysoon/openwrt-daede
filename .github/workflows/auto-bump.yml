@@ -6,7 +6,7 @@ name: Auto bump dae/daed
 
 on:
   schedule:
-    - cron: '30 3 * * *'
+    - cron: '30 */6 * * *'
   workflow_dispatch:
 
 permissions:
