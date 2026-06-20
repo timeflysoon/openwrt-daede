@@ -3,7 +3,8 @@
 set -eu
 
 B2_FEED_BASE_URL="https://kenzo111.s3.us-west-004.backblazeb2.com/openwrt-feed/daed"
-GITHUB_API_URL="https://api.github.com/repos/kenzok8/luci-app-daed/releases/latest"
+B2_FEED_FALLBACK_URL="https://down.dllkids.xyz/openwrt-feed/daed"
+GITHUB_API_URL="https://api.github.com/repos/kenzok8/openwrt-daede/releases/latest"
 GITHUB_PROXY_PREFIX="${GITHUB_PROXY_PREFIX:-https://ghfast.top/}"
 TMP_DIR="/tmp/daede-install"
 
@@ -54,7 +55,15 @@ detect_arch() {
     opkg print-architecture | awk '/^arch / {print $2}' | tail -n 1
     return
   fi
-  apk --print-arch
+  # apk --print-arch only returns the CPU family (e.g. aarch64), dropping the
+  # subtarget suffix; feed/release use the full target arch (aarch64_cortex-a53),
+  # so prefer DISTRIB_ARCH.
+  distrib_arch="$(sed -n "s/^DISTRIB_ARCH=['\"]\([^'\"]*\)['\"].*/\1/p" /etc/openwrt_release 2>/dev/null | head -n 1)"
+  if [ -n "$distrib_arch" ]; then
+    printf '%s\n' "$distrib_arch"
+  else
+    apk --print-arch
+  fi
 }
 
 detect_sdk() {
@@ -66,8 +75,14 @@ detect_sdk() {
   printf '%s\n' "$sdk"
 }
 
+# Two B2-compatible bases tried per SDK/arch: primary B2 bucket, then the
+# dllkids mirror (reachable from mainland China when B2 is blocked).
+feed_bases() {
+  printf '%s\n%s\n' "$B2_FEED_BASE_URL" "$B2_FEED_FALLBACK_URL"
+}
+
 feed_base_for() {
-  printf '%s/%s/%s' "$B2_FEED_BASE_URL" "$1" "$2"
+  printf '%s/%s/%s' "$1" "$2" "$3"
 }
 
 # Which packages to fetch, in install order (core before luci so opkg/apk can
@@ -96,23 +111,29 @@ manifest_value() {
 resolve_from_manifest() {
   sdk="$1"
   arch="$2"
-  base="$(feed_base_for "$sdk" "$arch")"
-  MANIFEST_TEXT="$(fetch_text "${base}/manifest-daede.txt" || true)"
-  [ -n "$MANIFEST_TEXT" ] || return 1
+  for fb in $(feed_bases); do
+    base="$(feed_base_for "$fb" "$sdk" "$arch")"
+    MANIFEST_TEXT="$(fetch_text "${base}/manifest-daede.txt" || true)"
+    [ -n "$MANIFEST_TEXT" ] || continue
 
-  plan=""
-  for pkg in $(wanted_pkgs); do
-    file="$(manifest_value "$pkg")"
-    if [ -z "$file" ]; then
-      echo "Manifest has no entry for '$pkg' on ${sdk}/${arch}"
-      return 1
-    fi
-    sha="$(manifest_value "${pkg}_sha256")"
-    plan="${plan}${pkg}|${base}/${file}|${sha}
+    plan=""
+    ok=1
+    for pkg in $(wanted_pkgs); do
+      file="$(manifest_value "$pkg")"
+      if [ -z "$file" ]; then
+        echo "Manifest has no entry for '$pkg' on ${sdk}/${arch}"
+        ok=0
+        break
+      fi
+      sha="$(manifest_value "${pkg}_sha256")"
+      plan="${plan}${pkg}|${base}/${file}|${sha}
 "
+    done
+    [ "$ok" = 1 ] || continue
+    PLAN="$plan"
+    return 0
   done
-  PLAN="$plan"
-  return 0
+  return 1
 }
 
 # GitHub release fallback (best effort, no sha256 available there).
